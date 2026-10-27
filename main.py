@@ -4,16 +4,9 @@ import requests
 from datetime import datetime, timezone
 
 # ============================================================
-# ATI FUTURES V2
+# ATI FUTURES V3
 # Tabdeal Futures | PAPER | MACD 12/26/9 | 5m
-#
-# هدف:
-# 1) دریافت بازارهای Futures
-# 2) دریافت کندل‌های 5 دقیقه‌ای
-# 3) حذف کندل جاری و استفاده فقط از کندل بسته‌شده
-# 4) محاسبه MACD 12/26/9
-# 5) تشخیص کراس BUY / SELL
-# 6) ارسال گزارش به Telegram
+# Telegram diagnostics + heartbeat
 #
 # REAL TRADING: DISABLED
 # ============================================================
@@ -21,12 +14,8 @@ from datetime import datetime, timezone
 API_KEY = os.getenv("TABDEAL_API_KEY", "")
 API_SECRET = os.getenv("TABDEAL_API_SECRET", "")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# ------------------------------------------------------------
-# Tabdeal
-# ------------------------------------------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 BASE_URLS = [
     "https://api1.tabdeal.org",
@@ -43,10 +32,6 @@ KLINE_PATHS = [
     "/fapi/v1/klines",
 ]
 
-# ------------------------------------------------------------
-# Strategy
-# ------------------------------------------------------------
-
 INTERVAL = "5m"
 
 MACD_FAST = 12
@@ -57,77 +42,264 @@ MAX_MARKETS = 30
 KLINE_LIMIT = 100
 
 REQUEST_TIMEOUT = 12
+TELEGRAM_TIMEOUT = 20
 REQUEST_DELAY = 0.10
 
-# ------------------------------------------------------------
-# Risk / trading
-# ------------------------------------------------------------
-
 PAPER_MODE = True
+REAL_TRADING = False
 
 LEVERAGE = 3
 MARGIN_USDT = 2.0
 
-# بسیار مهم:
-# این نسخه هیچ سفارش واقعی ارسال نمی‌کند.
-REAL_TRADING = False
+
+# ============================================================
+# TIME
+# ============================================================
+
+def utc_now():
+    return datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram: credentials missing")
-        return False
+def telegram_configured():
+    return bool(
+        TELEGRAM_TOKEN
+        and TELEGRAM_CHAT_ID
+    )
+
+
+def telegram_api(method, payload=None):
+    if not TELEGRAM_TOKEN:
+        print("Telegram: BOT TOKEN MISSING")
+        return None
 
     url = (
         f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
+        f"bot{TELEGRAM_TOKEN}/"
+        f"{method}"
     )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-    }
 
     try:
         response = requests.post(
             url,
-            json=payload,
-            timeout=15,
+            json=payload or {},
+            timeout=TELEGRAM_TIMEOUT,
         )
-
-        if response.ok:
-            print("Telegram: OK")
-            return True
 
         print(
-            "Telegram error:",
-            response.status_code,
-            response.text[:500],
+            f"Telegram API {method}: "
+            f"HTTP {response.status_code}"
         )
 
-    except Exception as exc:
-        print("Telegram exception:", exc)
+        try:
+            data = response.json()
+        except Exception:
+            data = {
+                "ok": False,
+                "description": response.text[:500],
+            }
 
-    return False
+        if not response.ok:
+            print(
+                "Telegram HTTP ERROR:",
+                response.text[:1000],
+            )
+            return data
+
+        if not data.get("ok", False):
+            print(
+                "Telegram API ERROR:",
+                data,
+            )
+            return data
+
+        return data
+
+    except Exception as exc:
+        print(
+            f"Telegram exception ({method}):",
+            repr(exc),
+        )
+        return None
+
+
+def telegram_test():
+    """
+    تست کامل Bot Token با getMe.
+    """
+
+    print()
+    print("=" * 64)
+    print("TELEGRAM DIAGNOSTIC")
+    print("=" * 64)
+
+    if not TELEGRAM_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN is MISSING")
+        print("=" * 64)
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print("❌ TELEGRAM_CHAT_ID is MISSING")
+        print("=" * 64)
+        return False
+
+    print(
+        "BOT TOKEN: configured "
+        f"(length={len(TELEGRAM_TOKEN)})"
+    )
+
+    print(
+        "CHAT ID: configured "
+        f"(length={len(TELEGRAM_CHAT_ID)})"
+    )
+
+    result = telegram_api("getMe")
+
+    if not result or not result.get("ok"):
+        print("❌ Telegram bot authentication FAILED")
+        print("=" * 64)
+        return False
+
+    bot = result.get("result", {})
+
+    print(
+        "✅ Telegram bot connected:"
+    )
+
+    print(
+        "   username:",
+        bot.get("username", "-"),
+    )
+
+    print(
+        "   name:",
+        bot.get("first_name", "-"),
+    )
+
+    print("=" * 64)
+
+    return True
+
+
+def telegram(message):
+    """
+    ارسال پیام به Telegram.
+    """
+
+    if not TELEGRAM_TOKEN:
+        print(
+            "Telegram: "
+            "TELEGRAM_BOT_TOKEN MISSING"
+        )
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print(
+            "Telegram: "
+            "TELEGRAM_CHAT_ID MISSING"
+        )
+        return False
+
+    if not message:
+        print("Telegram: empty message")
+        return False
+
+    # Telegram حدود 4096 کاراکتر را قبول می‌کند.
+    # برای جلوگیری از خطای طول پیام، خرد می‌کنیم.
+    max_length = 3900
+
+    chunks = []
+
+    while len(message) > max_length:
+        split_at = message.rfind(
+            "\n",
+            0,
+            max_length,
+        )
+
+        if split_at <= 0:
+            split_at = max_length
+
+        chunks.append(
+            message[:split_at]
+        )
+
+        message = message[split_at:]
+
+    if message:
+        chunks.append(message)
+
+    success = True
+
+    for index, chunk in enumerate(chunks, 1):
+
+        print(
+            f"Telegram: sending "
+            f"message {index}/{len(chunks)}..."
+        )
+
+        result = telegram_api(
+            "sendMessage",
+            {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "disable_web_page_preview": True,
+            },
+        )
+
+        if not result or not result.get("ok"):
+            success = False
+
+            print(
+                "❌ Telegram send failed."
+            )
+
+            if result:
+                print(
+                    "Telegram description:",
+                    result.get(
+                        "description",
+                        "unknown error",
+                    ),
+                )
+
+        else:
+            print(
+                f"✅ Telegram message "
+                f"{index}/{len(chunks)} sent."
+            )
+
+    return success
 
 
 # ============================================================
 # HTTP
 # ============================================================
 
-def http_get(base_url, path, params=None):
-    url = base_url.rstrip("/") + path
+def http_get(
+    base_url,
+    path,
+    params=None,
+):
+
+    url = (
+        base_url.rstrip("/")
+        + path
+    )
 
     response = requests.get(
         url,
         params=params or {},
         timeout=REQUEST_TIMEOUT,
         headers={
-            "User-Agent": "ATI-FUTURES-V2",
+            "User-Agent": "ATI-FUTURES-V3",
             "Accept": "application/json",
         },
     )
@@ -157,6 +329,7 @@ def http_get(base_url, path, params=None):
 # ============================================================
 
 def get_exchange_info():
+
     errors = []
 
     for base_url in BASE_URLS:
@@ -164,6 +337,7 @@ def get_exchange_info():
         for path in EXCHANGE_INFO_PATHS:
 
             try:
+
                 data = http_get(
                     base_url,
                     path,
@@ -176,6 +350,7 @@ def get_exchange_info():
                         list,
                     )
                 ):
+
                     print(
                         "ExchangeInfo OK:",
                         base_url + path,
@@ -185,12 +360,14 @@ def get_exchange_info():
 
                 errors.append(
                     f"{base_url}{path}: "
-                    "invalid exchangeInfo"
+                    f"invalid exchangeInfo"
                 )
 
             except Exception as exc:
+
                 errors.append(
-                    f"{base_url}{path}: {exc}"
+                    f"{base_url}{path}: "
+                    f"{exc}"
                 )
 
     raise RuntimeError(
@@ -200,21 +377,14 @@ def get_exchange_info():
 
 
 # ============================================================
-# MARKET DISCOVERY
+# SYMBOL
 # ============================================================
 
 def normalize_symbol(symbol):
-    """
-    تبدیل نام‌های احتمالی بازار به فرم استاندارد.
 
-    Examples:
-        BTC_USDT -> BTCUSDT
-        BTC-USDT -> BTCUSDT
-        BTC/USDT -> BTCUSDT
-        BTCUSDT  -> BTCUSDT
-    """
-
-    symbol = str(symbol or "").upper()
+    symbol = str(
+        symbol or ""
+    ).upper()
 
     symbol = symbol.replace(
         "_",
@@ -234,7 +404,12 @@ def normalize_symbol(symbol):
     return symbol
 
 
+# ============================================================
+# MARKETS
+# ============================================================
+
 def get_markets():
+
     data = get_exchange_info()
 
     raw_symbols = data.get(
@@ -246,7 +421,10 @@ def get_markets():
 
     for item in raw_symbols:
 
-        if not isinstance(item, dict):
+        if not isinstance(
+            item,
+            dict,
+        ):
             continue
 
         raw_symbol = item.get(
@@ -275,16 +453,16 @@ def get_markets():
         if not symbol:
             continue
 
-        # فقط USDT Futures
         if quote and quote != "USDT":
             continue
 
         if not symbol.endswith("USDT"):
             continue
 
-        # اگر status وجود داشت،
-        # فقط TRADING
-        if status and status != "TRADING":
+        if (
+            status
+            and status != "TRADING"
+        ):
             continue
 
         if symbol not in markets:
@@ -300,9 +478,6 @@ def get_markets():
 # ============================================================
 
 def get_klines(symbol):
-    """
-    تلاش برای دریافت کندل از endpointهای شناخته‌شده.
-    """
 
     errors = []
 
@@ -317,6 +492,7 @@ def get_klines(symbol):
         for path in KLINE_PATHS:
 
             try:
+
                 data = http_get(
                     base_url,
                     path,
@@ -331,42 +507,40 @@ def get_klines(symbol):
 
                 errors.append(
                     f"{base_url}{path}: "
-                    "empty response"
+                    f"empty response"
                 )
 
             except Exception as exc:
 
                 errors.append(
-                    f"{base_url}{path}: {exc}"
+                    f"{base_url}{path}: "
+                    f"{exc}"
                 )
 
     print(
-        f"{symbol}: all kline endpoints failed"
+        f"{symbol}: "
+        f"all kline endpoints failed"
     )
 
     for error in errors:
-        print("   ", error)
+        print(
+            "   ",
+            error,
+        )
 
     return []
 
 
 # ============================================================
-# CANDLE PARSER
+# CANDLE
 # ============================================================
 
 def candle_close(candle):
-    """
-    Binance-compatible candle:
 
-    0 = open time
-    1 = open
-    2 = high
-    3 = low
-    4 = close
-    5 = volume
-    """
-
-    if not isinstance(candle, (list, tuple)):
+    if not isinstance(
+        candle,
+        (list, tuple),
+    ):
         return None
 
     if len(candle) < 5:
@@ -380,24 +554,20 @@ def candle_close(candle):
 
 
 def extract_closed_closes(raw):
-    """
-    فقط کندل‌های معتبر را استخراج می‌کند.
 
-    مهم:
-    آخرین کندل در بسیاری از APIها ممکن است
-    هنوز در حال تشکیل باشد.
-
-    بنابراین آخرین کندل را حذف می‌کنیم.
-    """
-
-    if not isinstance(raw, list):
+    if not isinstance(
+        raw,
+        list,
+    ):
         return []
 
     closes = []
 
     for candle in raw:
 
-        value = candle_close(candle)
+        value = candle_close(
+            candle
+        )
 
         if value is None:
             continue
@@ -407,8 +577,7 @@ def extract_closed_closes(raw):
 
         closes.append(value)
 
-    # حداقل دو کندل لازم است تا بتوانیم
-    # کندل جاری را حذف کنیم.
+    # حذف آخرین کندل جاری
     if len(closes) >= 2:
         closes = closes[:-1]
 
@@ -420,6 +589,7 @@ def extract_closed_closes(raw):
 # ============================================================
 
 def ema(values, period):
+
     if not values:
         return []
 
@@ -430,9 +600,10 @@ def ema(values, period):
         period + 1
     )
 
-    first = sum(
-        values[:period]
-    ) / period
+    first = (
+        sum(values[:period])
+        / period
+    )
 
     result = [first]
 
@@ -442,13 +613,16 @@ def ema(values, period):
 
         current = (
             (
-                value - previous
+                value
+                - previous
             )
             * multiplier
             + previous
         )
 
-        result.append(current)
+        result.append(
+            current
+        )
 
         previous = current
 
@@ -483,7 +657,6 @@ def calculate_macd(closes):
     if not fast or not slow:
         return None
 
-    # EMA سریع نسبت به EMA کند جلوتر است.
     offset = (
         MACD_SLOW
         - MACD_FAST
@@ -512,12 +685,17 @@ def calculate_macd(closes):
 
     macd_line = []
 
-    for fast_value, slow_value in zip(
+    for (
+        fast_value,
+        slow_value,
+    ) in zip(
         fast_aligned,
         slow_aligned,
     ):
+
         macd_line.append(
-            fast_value - slow_value
+            fast_value
+            - slow_value
         )
 
     signal_line = ema(
@@ -567,7 +745,6 @@ def calculate_macd(closes):
         "macd": current_macd,
         "signal": current_signal,
         "histogram": current_histogram,
-
         "previous_macd": previous_macd,
         "previous_signal": previous_signal,
         "previous_histogram": previous_histogram,
@@ -599,7 +776,6 @@ def get_signal(macd):
         "signal"
     ]
 
-    # کراس صعودی
     bullish_cross = (
         previous_macd
         <= previous_signal
@@ -608,7 +784,6 @@ def get_signal(macd):
         > current_signal
     )
 
-    # کراس نزولی
     bearish_cross = (
         previous_macd
         >= previous_signal
@@ -631,6 +806,7 @@ def get_signal(macd):
 # ============================================================
 
 def fmt(value):
+
     if value is None:
         return "-"
 
@@ -658,7 +834,7 @@ def run():
 
     print()
     print("=" * 64)
-    print("🤖 ATI FUTURES V2")
+    print("🤖 ATI FUTURES V3")
     print("=" * 64)
     print("Exchange : Tabdeal Futures")
     print("Mode     : PAPER")
@@ -670,29 +846,61 @@ def run():
     print("Margin   :", MARGIN_USDT, "USDT")
     print("=" * 64)
 
-    # --------------------------------------------------------
-    # Credentials
-    # --------------------------------------------------------
+    # ========================================================
+    # TELEGRAM TEST
+    # ========================================================
+
+    telegram_ok = telegram_test()
+
+    if telegram_ok:
+
+        startup_message = (
+            "🤖 ATI FUTURES V3\n\n"
+            "🟢 Bot started successfully\n"
+            "🟢 Telegram connection: OK\n"
+            "🟢 PAPER MODE\n"
+            "🚫 REAL TRADING: DISABLED\n\n"
+            "Exchange: Tabdeal Futures\n"
+            "MACD: 12/26/9\n"
+            "Timeframe: 5m\n\n"
+            f"Time: {utc_now()}"
+        )
+
+        telegram(
+            startup_message
+        )
+
+    else:
+
+        print(
+            "⚠️ Telegram is NOT working."
+        )
+
+    # ========================================================
+    # CREDENTIALS
+    # ========================================================
 
     if API_KEY:
-        print("TABDEAL_API_KEY: OK")
+        print(
+            "TABDEAL_API_KEY: OK"
+        )
     else:
         print(
-            "TABDEAL_API_KEY: MISSING "
-            "(not required for public scan)"
+            "TABDEAL_API_KEY: MISSING"
         )
 
     if API_SECRET:
-        print("TABDEAL_API_SECRET: OK")
+        print(
+            "TABDEAL_API_SECRET: OK"
+        )
     else:
         print(
-            "TABDEAL_API_SECRET: MISSING "
-            "(not required for public scan)"
+            "TABDEAL_API_SECRET: MISSING"
         )
 
-    # --------------------------------------------------------
-    # Exchange Info
-    # --------------------------------------------------------
+    # ========================================================
+    # EXCHANGE
+    # ========================================================
 
     try:
 
@@ -701,27 +909,33 @@ def run():
     except Exception as exc:
 
         error_text = (
-            "❌ ATI FUTURES V2\n\n"
+            "❌ ATI FUTURES V3\n\n"
             "ExchangeInfo FAILED\n\n"
-            f"Error:\n{exc}"
+            f"Error:\n{exc}\n\n"
+            f"Time: {utc_now()}"
         )
 
         print(error_text)
 
-        telegram(error_text)
+        telegram(
+            error_text
+        )
 
         return
 
     if not markets:
 
         error_text = (
-            "❌ ATI FUTURES V2\n\n"
-            "No USDT Futures markets found."
+            "❌ ATI FUTURES V3\n\n"
+            "No USDT Futures markets found.\n\n"
+            f"Time: {utc_now()}"
         )
 
         print(error_text)
 
-        telegram(error_text)
+        telegram(
+            error_text
+        )
 
         return
 
@@ -736,9 +950,9 @@ def run():
         ", ".join(markets),
     )
 
-    # --------------------------------------------------------
-    # Scanner
-    # --------------------------------------------------------
+    # ========================================================
+    # SCANNER
+    # ========================================================
 
     checked = 0
     ready = 0
@@ -780,7 +994,7 @@ def run():
 
                 print(
                     f"{symbol}: "
-                    f"insufficient closed candles "
+                    f"insufficient candles "
                     f"({len(closes)})"
                 )
 
@@ -833,7 +1047,7 @@ def run():
                     "histogram": macd[
                         "histogram"
                     ],
-                })
+                )
 
         except Exception as exc:
 
@@ -848,29 +1062,16 @@ def run():
             REQUEST_DELAY
         )
 
-    # --------------------------------------------------------
-    # Runtime
-    # --------------------------------------------------------
+    # ========================================================
+    # SUMMARY
+    # ========================================================
 
     runtime = (
         time.time()
         - started
     )
 
-    total_signals = (
-        len(buy_signals)
-        + len(sell_signals)
-    )
-
-    now = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
-
-    # --------------------------------------------------------
-    # Console summary
-    # --------------------------------------------------------
+    now = utc_now()
 
     print()
     print("=" * 64)
@@ -911,12 +1112,12 @@ def run():
 
     print("=" * 64)
 
-    # --------------------------------------------------------
-    # Telegram
-    # --------------------------------------------------------
+    # ========================================================
+    # TELEGRAM REPORT
+    # ========================================================
 
     text = (
-        "🤖 ATI FUTURES V2\n\n"
+        "🤖 ATI FUTURES V3\n\n"
         "🟢 PAPER MODE\n"
         "🚫 REAL TRADING: DISABLED\n\n"
         "Exchange: Tabdeal Futures\n"
@@ -933,43 +1134,46 @@ def run():
         f"Runtime: {runtime:.1f}s\n\n"
     )
 
-    # --------------------------------------------------------
-    # BUY
-    # --------------------------------------------------------
-
     if buy_signals:
 
-        text += "🟢 BUY SIGNALS\n\n"
+        text += (
+            "🟢 BUY SIGNALS\n\n"
+        )
 
         for item in buy_signals[:5]:
 
             text += (
                 f"📈 {item['symbol']}\n"
-                f"MACD: {fmt(item['macd'])}\n"
-                f"Signal: {fmt(item['signal'])}\n"
+                f"MACD: "
+                f"{fmt(item['macd'])}\n"
+                f"Signal: "
+                f"{fmt(item['signal'])}\n"
                 f"Histogram: "
                 f"{fmt(item['histogram'])}\n\n"
             )
 
-    # --------------------------------------------------------
-    # SELL
-    # --------------------------------------------------------
-
     if sell_signals:
 
-        text += "🔴 SELL SIGNALS\n\n"
+        text += (
+            "🔴 SELL SIGNALS\n\n"
+        )
 
         for item in sell_signals[:5]:
 
             text += (
                 f"📉 {item['symbol']}\n"
-                f"MACD: {fmt(item['macd'])}\n"
-                f"Signal: {fmt(item['signal'])}\n"
+                f"MACD: "
+                f"{fmt(item['macd'])}\n"
+                f"Signal: "
+                f"{fmt(item['signal'])}\n"
                 f"Histogram: "
                 f"{fmt(item['histogram'])}\n\n"
             )
 
-    if not buy_signals and not sell_signals:
+    if (
+        not buy_signals
+        and not sell_signals
+    ):
 
         text += (
             "⚪ No new MACD cross\n"
@@ -980,7 +1184,9 @@ def run():
         f"Time: {now}"
     )
 
-    telegram(text)
+    telegram(
+        text
+    )
 
 
 # ============================================================
