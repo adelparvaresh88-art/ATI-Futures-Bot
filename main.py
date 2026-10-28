@@ -1,28 +1,23 @@
+
 import os
 import time
 import requests
 from datetime import datetime, timezone
 
+# ATI FUTURES BOT V7 - DIAGNOSTIC PAPER MODE
 
-# ============================================================
-# ATI FUTURES BOT V6
-# Tabdeal Futures | PAPER | MACD 12/26/9 | 5m
-# No Tabdeal SDK required
-# ============================================================
-
-API_KEY = os.getenv("TABDEAL_API_KEY", "")
-API_SECRET = os.getenv("TABDEAL_API_SECRET", "")
+BASE_URLS = [
+    "https://api1.tabdeal.org",
+    "https://api.tabdeal.org",
+]
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BASE_URL = "https://api1.tabdeal.org"
-
 INTERVAL = "5m"
-
 MAX_MARKETS = 30
 KLINE_LIMIT = 200
-REQUEST_TIMEOUT = 15
+TIMEOUT = 12
 
 FAST_PERIOD = 12
 SLOW_PERIOD = 26
@@ -30,25 +25,17 @@ SIGNAL_PERIOD = 9
 
 PAPER_MODE = True
 REAL_TRADING = False
-
 LEVERAGE = 3
 MARGIN_USDT = 2.0
-
 TP_PCT = 0.02
 SL_PCT = 0.01
 
-
 session = requests.Session()
-
 session.headers.update({
-    "User-Agent": "ATI-Futures-Bot/6.0",
+    "User-Agent": "ATI-Futures-Bot/7.0",
     "Accept": "application/json",
 })
 
-
-# ============================================================
-# TIME
-# ============================================================
 
 def now_utc():
     return datetime.now(timezone.utc).strftime(
@@ -56,541 +43,254 @@ def now_utc():
     )
 
 
-# ============================================================
-# SAFE FLOAT
-# ============================================================
-
 def safe_float(value, default=0.0):
     try:
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-
 def send_telegram(message):
-
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials not configured.")
+        print("Telegram credentials missing")
         return False
 
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
     try:
-        response = session.post(
-            url,
+        r = session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
+                "text": message[:4000],
             },
-            timeout=REQUEST_TIMEOUT,
+            timeout=TIMEOUT,
         )
-
-        if response.ok:
-            return True
-
-        print(
-            f"Telegram HTTP {response.status_code}: "
-            f"{response.text[:200]}"
-        )
-
+        print("Telegram:", r.status_code, r.text[:200])
+        return r.ok
     except requests.RequestException as exc:
-        print(
-            f"Telegram error: {str(exc)[:200]}"
-        )
-
-    return False
+        print("Telegram error:", str(exc)[:200])
+        return False
 
 
-# ============================================================
-# HTTP GET
-# ============================================================
-
-def api_get(path, params=None):
-
-    url = BASE_URL + path
-
+def get_json(base, path, params=None):
     try:
-        response = session.get(
-            url,
+        r = session.get(
+            base + path,
             params=params or {},
-            timeout=REQUEST_TIMEOUT,
+            timeout=TIMEOUT,
         )
-
-        if response.status_code != 200:
-            print(
-                f"GET {path} -> "
-                f"HTTP {response.status_code}"
-            )
-            return None
+        preview = r.text[:180].replace("\n", " ")
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {preview}"
 
         try:
-            return response.json()
-
+            return r.json(), "OK"
         except ValueError:
-            print(
-                f"GET {path} -> invalid JSON"
-            )
-            return None
+            return None, f"INVALID JSON: {preview}"
 
     except requests.RequestException as exc:
-        print(
-            f"GET {path} -> "
-            f"{str(exc)[:150]}"
-        )
-        return None
+        return None, f"REQUEST ERROR: {str(exc)[:120]}"
 
 
-# ============================================================
-# EXCHANGE INFO
-# ============================================================
-
-def get_exchange_info():
-
+def get_markets():
     paths = [
         "/r/fapi/v1/exchangeInfo",
         "/fapi/v1/exchangeInfo",
     ]
 
-    for path in paths:
+    for base in BASE_URLS:
+        for path in paths:
+            data, status = get_json(base, path)
+            print("EXCHANGE INFO", base + path, status)
 
-        data = api_get(path)
+            if not isinstance(data, dict):
+                continue
 
-        if not isinstance(data, dict):
-            continue
+            symbols = data.get("symbols")
+            if not isinstance(symbols, list):
+                continue
 
-        symbols = data.get("symbols")
+            markets = []
+            for item in symbols:
+                if not isinstance(item, dict):
+                    continue
 
-        if isinstance(symbols, list) and symbols:
-            print(
-                f"Exchange info OK: "
-                f"{len(symbols)} symbols"
-            )
-            return data
+                raw = str(
+                    item.get("symbol", item.get("pair", ""))
+                ).upper()
 
-    print("Exchange info unavailable.")
-    return None
+                symbol = raw.replace("_", "").replace("-", "")
+                quote = str(
+                    item.get("quoteAsset", item.get("quote", "USDT"))
+                ).upper()
+                status = str(item.get("status", "TRADING")).upper()
 
+                if (
+                    symbol.endswith("USDT")
+                    and quote == "USDT"
+                    and status in ("TRADING", "ACTIVE", "ENABLED")
+                    and symbol not in markets
+                ):
+                    markets.append(symbol)
 
-# ============================================================
-# NORMALIZE SYMBOL
-# ============================================================
+            if markets:
+                print("MARKETS FOUND:", len(markets))
+                return markets[:MAX_MARKETS]
 
-def normalize_symbol(symbol):
+    return []
 
-    symbol = str(symbol).upper().strip()
-
-    for char in ("_", "-", "/"):
-        symbol = symbol.replace(char, "")
-
-    return symbol
-
-
-# ============================================================
-# MARKETS
-# ============================================================
-
-def get_markets():
-
-    data = get_exchange_info()
-
-    if not data:
-        return []
-
-    markets = []
-
-    for item in data.get("symbols", []):
-
-        if not isinstance(item, dict):
-            continue
-
-        raw_symbol = item.get(
-            "symbol",
-            item.get("pair", "")
-        )
-
-        symbol = normalize_symbol(raw_symbol)
-
-        if not symbol:
-            continue
-
-        status = str(
-            item.get("status", "TRADING")
-        ).upper()
-
-        quote = str(
-            item.get(
-                "quoteAsset",
-                item.get("quote", "USDT")
-            )
-        ).upper()
-
-        if status not in (
-            "TRADING",
-            "ACTIVE",
-            "ENABLED",
-        ):
-            continue
-
-        if quote != "USDT":
-            continue
-
-        if not symbol.endswith("USDT"):
-            continue
-
-        if symbol not in markets:
-            markets.append(symbol)
-
-    return markets[:MAX_MARKETS]
-
-
-# ============================================================
-# KLINES
-# ============================================================
 
 def get_klines(symbol):
-
-    normalized = normalize_symbol(symbol)
-
-    candidates = [
-        normalized,
-        normalized.replace("USDT", "_USDT"),
+    # Test both symbol formats and likely API paths.
+    symbols = [
+        symbol,
+        symbol.replace("USDT", "_USDT"),
     ]
 
     paths = [
         "/r/fapi/v1/klines",
         "/fapi/v1/klines",
+        "/r/fapi/v1/continuousKlines",
+        "/fapi/v1/continuousKlines",
     ]
 
-    for path in paths:
+    diagnostics = []
 
-        for candidate in candidates:
+    for base in BASE_URLS:
+        for path in paths:
+            for candidate in symbols:
+                params = {
+                    "symbol": candidate,
+                    "interval": INTERVAL,
+                    "limit": KLINE_LIMIT,
+                }
 
-            params = {
-                "symbol": candidate,
-                "interval": INTERVAL,
-                "limit": KLINE_LIMIT,
-            }
+                # continuousKlines can require pair and contractType.
+                if "continuousKlines" in path:
+                    params = {
+                        "pair": candidate,
+                        "contractType": "PERPETUAL",
+                        "interval": INTERVAL,
+                        "limit": KLINE_LIMIT,
+                    }
 
-            try:
+                data, status = get_json(base, path, params)
 
-                response = session.get(
-                    BASE_URL + path,
-                    params=params,
-                    timeout=REQUEST_TIMEOUT,
+                if isinstance(data, list) and len(data) >= 40:
+                    valid = []
+                    for candle in data:
+                        if not isinstance(candle, list) or len(candle) < 7:
+                            continue
+                        close = safe_float(candle[4])
+                        close_time = safe_float(candle[6])
+                        if close > 0 and close_time > 0:
+                            valid.append(candle)
+
+                    if len(valid) >= 40:
+                        print(
+                            "KLINES OK:", symbol, base + path,
+                            "symbol=", candidate, "candles=", len(valid)
+                        )
+                        return valid
+
+                    status = f"LIST BUT INVALID/SHORT: {len(valid)}"
+
+                diagnostics.append(
+                    f"{base}{path} [{candidate}]: {status}"
                 )
 
-                if response.status_code != 200:
-                    continue
-
-                data = response.json()
-
-                if not isinstance(data, list):
-                    continue
-
-                if len(data) < 40:
-                    continue
-
-                valid = []
-
-                for candle in data:
-
-                    if not isinstance(candle, list):
-                        continue
-
-                    if len(candle) < 7:
-                        continue
-
-                    close_price = safe_float(
-                        candle[4]
-                    )
-
-                    close_time = safe_float(
-                        candle[6]
-                    )
-
-                    if close_price <= 0:
-                        continue
-
-                    if close_time <= 0:
-                        continue
-
-                    valid.append(candle)
-
-                if len(valid) >= 40:
-                    return valid
-
-            except Exception:
-                continue
+    print("KLINE DIAGNOSTICS", symbol)
+    for line in diagnostics[:8]:
+        print(" ", line)
 
     return []
 
 
-# ============================================================
-# CLOSED CANDLES
-# ============================================================
-
-def get_closed_closes(klines):
-
-    if not isinstance(klines, list):
-        return []
-
-    current_time_ms = int(
-        time.time() * 1000
-    )
-
-    closes = []
+def closed_closes(klines):
+    now_ms = int(time.time() * 1000)
+    result = []
 
     for candle in klines:
-
-        if not isinstance(candle, list):
-            continue
-
         if len(candle) < 7:
             continue
 
-        close_price = safe_float(
-            candle[4]
-        )
+        close = safe_float(candle[4])
+        close_time = safe_float(candle[6])
 
-        close_time = safe_float(
-            candle[6]
-        )
-
-        if close_price <= 0:
-            continue
-
-        if close_time <= 0:
-            continue
-
-        # Closed candle only
-        if close_time <= current_time_ms:
-            closes.append(close_price)
-
-    return closes
-
-
-# ============================================================
-# EMA
-# ============================================================
-
-def ema(values, period):
-
-    if not values:
-        return []
-
-    if period <= 0:
-        return []
-
-    if len(values) < period:
-        return []
-
-    multiplier = 2.0 / (
-        period + 1.0
-    )
-
-    initial = sum(
-        values[:period]
-    ) / period
-
-    result = [initial]
-
-    previous = initial
-
-    for price in values[period:]:
-
-        current = (
-            (price - previous)
-            * multiplier
-        ) + previous
-
-        result.append(current)
-
-        previous = current
+        if close > 0 and 0 < close_time < now_ms:
+            result.append(close)
 
     return result
 
 
-# ============================================================
-# MACD
-# ============================================================
+def ema(values, period):
+    if len(values) < period:
+        return []
+
+    alpha = 2.0 / (period + 1)
+    average = sum(values[:period]) / period
+    output = [average]
+
+    for value in values[period:]:
+        average = alpha * value + (1 - alpha) * average
+        output.append(average)
+
+    return output
+
 
 def calculate_macd(closes):
+    fast = ema(closes, FAST_PERIOD)
+    slow = ema(closes, SLOW_PERIOD)
 
-    minimum = (
-        SLOW_PERIOD
-        + SIGNAL_PERIOD
-        + 5
-    )
-
-    if len(closes) < minimum:
+    if not fast or not slow:
         return None
 
-    fast_ema = ema(
-        closes,
-        FAST_PERIOD
-    )
+    offset = SLOW_PERIOD - FAST_PERIOD
+    fast = fast[offset:]
+    n = min(len(fast), len(slow))
+    fast, slow = fast[-n:], slow[-n:]
 
-    slow_ema = ema(
-        closes,
-        SLOW_PERIOD
-    )
+    macd_line = [a - b for a, b in zip(fast, slow)]
+    signal_line = ema(macd_line, SIGNAL_PERIOD)
 
-    if not fast_ema or not slow_ema:
+    if len(signal_line) < 2:
         return None
 
-    offset = (
-        SLOW_PERIOD
-        - FAST_PERIOD
-    )
-
-    if len(fast_ema) <= offset:
-        return None
-
-    fast_aligned = fast_ema[offset:]
-
-    length = min(
-        len(fast_aligned),
-        len(slow_ema)
-    )
-
-    if length < SIGNAL_PERIOD + 2:
-        return None
-
-    fast_aligned = fast_aligned[-length:]
-    slow_aligned = slow_ema[-length:]
-
-    macd_values = []
-
-    for fast_value, slow_value in zip(
-        fast_aligned,
-        slow_aligned
-    ):
-        macd_values.append(
-            fast_value - slow_value
-        )
-
-    signal_values = ema(
-        macd_values,
-        SIGNAL_PERIOD
-    )
-
-    if len(signal_values) < 2:
-        return None
-
-    signal_offset = (
-        SIGNAL_PERIOD - 1
-    )
-
-    if len(macd_values) <= signal_offset:
-        return None
-
-    macd_aligned = (
-        macd_values[signal_offset:]
-    )
-
-    length = min(
-        len(macd_aligned),
-        len(signal_values)
-    )
-
-    if length < 2:
-        return None
-
-    macd_aligned = macd_aligned[-length:]
-    signal_values = signal_values[-length:]
+    macd_line = macd_line[SIGNAL_PERIOD - 1:]
+    n = min(len(macd_line), len(signal_line))
+    macd_line = macd_line[-n:]
+    signal_line = signal_line[-n:]
 
     return {
-        "previous_macd": macd_aligned[-2],
-        "previous_signal": signal_values[-2],
-        "macd": macd_aligned[-1],
-        "signal": signal_values[-1],
+        "pm": macd_line[-2],
+        "ps": signal_line[-2],
+        "m": macd_line[-1],
+        "s": signal_line[-1],
     }
 
 
-# ============================================================
-# SIGNAL
-# ============================================================
-
-def get_signal(macd):
-
-    if not macd:
+def get_signal(m):
+    if not m:
         return None
 
-    previous_macd = safe_float(
-        macd["previous_macd"]
-    )
-
-    previous_signal = safe_float(
-        macd["previous_signal"]
-    )
-
-    current_macd = safe_float(
-        macd["macd"]
-    )
-
-    current_signal = safe_float(
-        macd["signal"]
-    )
-
-    if (
-        previous_macd <= previous_signal
-        and current_macd > current_signal
-    ):
+    if m["pm"] <= m["ps"] and m["m"] > m["s"]:
         return "BUY"
 
-    if (
-        previous_macd >= previous_signal
-        and current_macd < current_signal
-    ):
+    if m["pm"] >= m["ps"] and m["m"] < m["s"]:
         return "SELL"
 
     return None
 
 
-# ============================================================
-# PAPER ORDER
-# ============================================================
-
-def create_paper_order(
-    symbol,
-    side,
-    entry
-):
-
-    entry = safe_float(entry)
-
+def make_paper_order(symbol, side, entry):
     if entry <= 0:
         return None
 
     if side == "BUY":
-
-        tp = entry * (
-            1.0 + TP_PCT
-        )
-
-        sl = entry * (
-            1.0 - SL_PCT
-        )
-
-    elif side == "SELL":
-
-        tp = entry * (
-            1.0 - TP_PCT
-        )
-
-        sl = entry * (
-            1.0 + SL_PCT
-        )
-
+        tp = entry * (1 + TP_PCT)
+        sl = entry * (1 - SL_PCT)
     else:
-        return None
+        tp = entry * (1 - TP_PCT)
+        sl = entry * (1 + SL_PCT)
 
     return {
         "symbol": symbol,
@@ -598,248 +298,106 @@ def create_paper_order(
         "entry": entry,
         "tp": tp,
         "sl": sl,
-        "leverage": LEVERAGE,
-        "margin": MARGIN_USDT,
     }
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
-
     started = time.time()
-
-    checked = 0
-    macd_ready = 0
-    buy_signals = 0
-    sell_signals = 0
-    no_data = 0
-    errors = 0
-
+    ready = buys = sells = no_data = errors = 0
     signals = []
 
-    print("")
-    print("======================================")
-    print("🤖 ATI FUTURES BOT V6")
-    print("======================================")
-    print("Mode: PAPER")
-    print("Exchange: Tabdeal Futures")
-    print("MACD: 12/26/9")
-    print("Timeframe: 5m")
-    print("Real orders: DISABLED")
-    print("======================================")
-    print("")
+    print("\nATI FUTURES V7 - PAPER MODE")
+    print("Real trading disabled:", not REAL_TRADING)
 
     markets = get_markets()
+    print("Markets:", len(markets))
 
     if not markets:
-
         message = (
-            "🤖 ATI FUTURES V6\n\n"
-            "🟢 PAPER MODE\n"
-            "Exchange: Tabdeal Futures\n\n"
-            "❌ No Futures markets found.\n\n"
+            "ATI FUTURES V7\n"
+            "No futures markets found.\n"
             f"Time: {now_utc()}"
         )
-
         print(message)
         send_telegram(message)
         return
 
-    print(
-        f"Markets loaded: {len(markets)}"
-    )
-
     for symbol in markets:
-
-        checked += 1
-
         try:
-
             klines = get_klines(symbol)
 
             if not klines:
-
                 no_data += 1
-
-                print(
-                    f"{symbol}: NO KLINE DATA"
-                )
-
                 continue
 
-            closes = get_closed_closes(
-                klines
-            )
-
+            closes = closed_closes(klines)
             if len(closes) < 40:
-
                 no_data += 1
-
-                print(
-                    f"{symbol}: "
-                    f"closed candles={len(closes)}"
-                )
-
+                print(symbol, "closed candles:", len(closes))
                 continue
 
-            macd = calculate_macd(
-                closes
-            )
-
+            macd = calculate_macd(closes)
             if not macd:
-
-                print(
-                    f"{symbol}: "
-                    "MACD NOT READY"
-                )
-
+                print(symbol, "MACD insufficient data")
                 continue
 
-            macd_ready += 1
+            ready += 1
+            side = get_signal(macd)
 
-            signal = get_signal(macd)
+            if side:
+                order = make_paper_order(symbol, side, closes[-1])
+                if order:
+                    signals.append(order)
+                    if side == "BUY":
+                        buys += 1
+                    else:
+                        sells += 1
 
-            if signal not in (
-                "BUY",
-                "SELL",
-            ):
-                continue
-
-            price = closes[-1]
-
-            order = create_paper_order(
-                symbol,
-                signal,
-                price
-            )
-
-            if not order:
-                continue
-
-            if signal == "BUY":
-                buy_signals += 1
-                icon = "🟢"
-
-            else:
-                sell_signals += 1
-                icon = "🔴"
-
-            signals.append(order)
-
-            print(
-                f"{icon} {signal} "
-                f"{symbol} "
-                f"Entry={price:.8f} "
-                f"TP={order['tp']:.8f} "
-                f"SL={order['sl']:.8f}"
-            )
+                    print(
+                        side, symbol,
+                        "entry=", order["entry"],
+                        "TP=", order["tp"],
+                        "SL=", order["sl"],
+                    )
 
         except Exception as exc:
-
             errors += 1
-
-            print(
-                f"{symbol}: ERROR "
-                f"{str(exc)[:150]}"
-            )
+            print(symbol, "ERROR:", str(exc)[:180])
 
     runtime = time.time() - started
 
-    print("")
-    print("======================================")
-    print("ATI FUTURES RESULT")
-    print("======================================")
-    print(
-        f"Markets: {len(markets)}"
-    )
-    print(
-        f"Checked: {checked}"
-    )
-    print(
-        f"MACD ready: {macd_ready}"
-    )
-    print(
-        f"BUY signals: {buy_signals}"
-    )
-    print(
-        f"SELL signals: {sell_signals}"
-    )
-    print(
-        f"No candle data: {no_data}"
-    )
-    print(
-        f"Errors: {errors}"
-    )
-    print(
-        f"Runtime: {runtime:.1f}s"
-    )
-    print(
-        f"Time: {now_utc()}"
-    )
-    print("======================================")
-
-    # ========================================================
-    # TELEGRAM MESSAGE
-    # ========================================================
-
     lines = [
-        "🤖 ATI FUTURES V6",
+        "🤖 ATI FUTURES V7",
         "",
         "🟢 PAPER MODE",
         "Exchange: Tabdeal Futures",
-        "MACD: 12/26/9",
-        "Timeframe: 5m",
+        "MACD: 12/26/9 | 5m",
         "Real orders: DISABLED",
         "",
     ]
 
-    if signals:
+    for order in signals[:10]:
+        lines.extend([
+            f"{order['side']} {order['symbol']}",
+            f"Entry: {order['entry']:.8f}",
+            f"TP: {order['tp']:.8f}",
+            f"SL: {order['sl']:.8f}",
+            "",
+        ])
 
-        for order in signals[:10]:
-
-            icon = (
-                "🟢"
-                if order["side"] == "BUY"
-                else "🔴"
-            )
-
-            lines.append(
-                f"{icon} {order['side']} "
-                f"{order['symbol']}"
-            )
-
-            lines.append(
-                f"Entry: {order['entry']:.8f}"
-            )
-
-            lines.append(
-                f"TP: {order['tp']:.8f}"
-            )
-
-            lines.append(
-                f"SL: {order['sl']:.8f}"
-            )
-
-            lines.append("")
-
-    else:
-
-        lines.append(
-            "⚪ No new MACD crossover signal."
-        )
-
-        lines.append("")
+    if not signals:
+        lines.extend([
+            "No new MACD crossover signal.",
+            "",
+        ])
 
     lines.extend([
         "--------------------------------",
         f"Markets: {len(markets)}",
-        f"Checked: {checked}",
-        f"MACD ready: {macd_ready}",
-        f"BUY: {buy_signals}",
-        f"SELL: {sell_signals}",
+        f"Checked: {len(markets)}",
+        f"MACD ready: {ready}",
+        f"BUY: {buys}",
+        f"SELL: {sells}",
         f"No data: {no_data}",
         f"Errors: {errors}",
         f"Runtime: {runtime:.1f}s",
@@ -847,26 +405,9 @@ def main():
     ])
 
     message = "\n".join(lines)
+    print("\n" + message)
+    send_telegram(message)
 
-    print("")
-    print(message)
-    print("")
-
-    telegram_ok = send_telegram(message)
-
-    print(
-        "Telegram: "
-        + (
-            "OK"
-            if telegram_ok
-            else "FAILED"
-        )
-    )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
