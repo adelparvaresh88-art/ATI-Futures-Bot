@@ -1,19 +1,8 @@
 import os
 import json
 import time
-import math
-import hmac
-import hashlib
 import requests
 from datetime import datetime, timezone
-
-# ============================================================
-# ATI FUTURES BOT V8
-# Tabdeal Futures
-# 5m candles built from live trades
-# MACD 12/26/9
-# PAPER MODE
-# ============================================================
 
 API_KEY = os.getenv("TABDEAL_API_KEY", "")
 API_SECRET = os.getenv("TABDEAL_API_SECRET", "")
@@ -25,52 +14,39 @@ BASE_URL = "https://api1.tabdeal.org"
 WS_URL = "wss://api1.tabdeal.org/special_margin/stream/"
 
 PAPER_MODE = True
-LEVERAGE = 3
-MARGIN_USDT = 2.0
 
-TIMEFRAME_MINUTES = 5
+MAX_MARKETS = 30
+MAX_CANDLES = 200
+
+TIMEFRAME_MS = 5 * 60 * 1000
 
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-MAX_MARKETS = 30
-MAX_CANDLES = 200
+RUN_SECONDS = 180
 REQUEST_TIMEOUT = 15
-
-RUN_SECONDS = 240
-TRADE_POLL_SECONDS = 3
 
 STATE_FILE = "ati_state.json"
 
 
-# ============================================================
-# LOG
-# ============================================================
-
-def log(message):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{now}] {message}", flush=True)
+def log(text):
+    now = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+    print(f"[{now}] {text}", flush=True)
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def telegram(message):
+def telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
     try:
-        url = (
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        )
-
         requests.post(
-            url,
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
+                "text": text,
             },
             timeout=10,
         )
@@ -78,120 +54,74 @@ def telegram(message):
         log(f"Telegram error: {e}")
 
 
-# ============================================================
-# SIGNATURE
-# ============================================================
-
-def sign_params(params):
-    query = "&".join(
-        f"{k}={params[k]}"
-        for k in sorted(params)
-    )
-
-    return hmac.new(
-        API_SECRET.encode(),
-        query.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-# ============================================================
-# REST REQUEST
-# ============================================================
-
 def public_get(path, params=None):
-    url = BASE_URL + path
-
     try:
-        response = requests.get(
-            url,
+        r = requests.get(
+            BASE_URL + path,
             params=params or {},
             timeout=REQUEST_TIMEOUT,
         )
 
-        if response.status_code != 200:
-            log(
-                f"HTTP {response.status_code} "
-                f"{path} -> {response.text[:300]}"
-            )
+        log(
+            f"GET {path} -> {r.status_code}"
+        )
+
+        if r.status_code != 200:
+            log(r.text[:500])
             return None
 
-        return response.json()
+        return r.json()
 
     except Exception as e:
-        log(f"GET error {path}: {e}")
+        log(f"GET error: {e}")
         return None
 
 
-# ============================================================
-# EXCHANGE INFO
-# ============================================================
-
 def get_exchange_info():
-    paths = [
+
+    for path in (
         "/r/fapi/v1/exchangeInfo",
         "/fapi/v1/exchangeInfo",
-    ]
+    ):
 
-    for path in paths:
         data = public_get(path)
 
         if data:
-            log(f"ExchangeInfo OK: {path}")
             return data
 
     return None
 
 
-# ============================================================
-# MARKET EXTRACTION
-# ============================================================
-
-def extract_markets(data):
+def get_markets(data):
 
     if not isinstance(data, dict):
         return []
 
-    raw = (
-        data.get("symbols")
-        or data.get("data")
-        or data.get("markets")
-        or []
-    )
+    raw = data.get("symbols") or []
 
     markets = []
-
-    if isinstance(raw, dict):
-        raw = list(raw.values())
 
     for item in raw:
 
         if not isinstance(item, dict):
             continue
 
-        symbol = (
-            item.get("symbol")
-            or item.get("contract")
-            or item.get("pair")
-            or item.get("market")
-        )
-
-        if not symbol:
-            continue
-
-        symbol = str(symbol).upper()
+        symbol = str(
+            item.get("symbol", "")
+        ).upper()
 
         status = str(
             item.get("status", "TRADING")
         ).upper()
 
         quote = str(
-            item.get("quoteAsset")
-            or item.get("quote")
-            or ""
+            item.get("quoteAsset", "")
         ).upper()
 
-        if status not in ("TRADING", "OPEN", ""):
+        if not symbol:
+            continue
+
+        if status not in ("TRADING", "OPEN"):
             continue
 
         if quote and quote != "USDT":
@@ -206,24 +136,8 @@ def extract_markets(data):
         if symbol not in markets:
             markets.append(symbol)
 
-    return markets
+    return markets[:MAX_MARKETS]
 
-
-# ============================================================
-# SYMBOL NORMALIZATION
-# ============================================================
-
-def ws_symbol(symbol):
-    return symbol.upper()
-
-
-def rest_symbol(symbol):
-    return symbol.replace("_", "").upper()
-
-
-# ============================================================
-# STATE
-# ============================================================
 
 def load_state():
 
@@ -236,24 +150,17 @@ def load_state():
             "r",
             encoding="utf-8",
         ) as f:
-            data = json.load(f)
+            return json.load(f)
 
-        if isinstance(data, dict):
-            return data
-
-    except Exception as e:
-        log(f"State load error: {e}")
-
-    return {}
+    except Exception:
+        return {}
 
 
 def save_state(state):
 
     try:
-        tmp = STATE_FILE + ".tmp"
-
         with open(
-            tmp,
+            STATE_FILE,
             "w",
             encoding="utf-8",
         ) as f:
@@ -261,196 +168,129 @@ def save_state(state):
                 state,
                 f,
                 ensure_ascii=False,
-                separators=(",", ":"),
             )
-
-        os.replace(tmp, STATE_FILE)
-
     except Exception as e:
         log(f"State save error: {e}")
 
-
-# ============================================================
-# EMA
-# ============================================================
 
 def ema(values, period):
 
     if len(values) < period:
         return []
 
-    multiplier = 2 / (period + 1)
+    multiplier = 2.0 / (period + 1)
 
-    result = []
-
-    seed = sum(values[:period]) / period
-
-    result.append(seed)
-
-    previous = seed
+    result = [
+        sum(values[:period]) / period
+    ]
 
     for value in values[period:]:
-
-        current = (
-            (value - previous) * multiplier
-            + previous
+        result.append(
+            (
+                value - result[-1]
+            ) * multiplier
+            + result[-1]
         )
-
-        result.append(current)
-
-        previous = current
 
     return result
 
 
-# ============================================================
-# MACD
-# ============================================================
-
 def calculate_macd(closes):
 
-    if len(closes) < MACD_SLOW + MACD_SIGNAL:
+    if len(closes) < 40:
         return None
 
-    fast = ema(closes, MACD_FAST)
-    slow = ema(closes, MACD_SLOW)
+    fast = ema(
+        closes,
+        MACD_FAST,
+    )
+
+    slow = ema(
+        closes,
+        MACD_SLOW,
+    )
 
     if not fast or not slow:
         return None
 
-    offset = MACD_SLOW - MACD_FAST
+    offset = (
+        MACD_SLOW - MACD_FAST
+    )
 
-    macd_values = []
+    macd = []
 
-    for i in range(len(slow)):
+    for i, slow_value in enumerate(slow):
 
-        fast_index = i + offset
+        fi = i + offset
 
-        if fast_index < 0:
-            continue
-
-        if fast_index >= len(fast):
+        if fi >= len(fast):
             break
 
-        macd_values.append(
-            fast[fast_index] - slow[i]
+        macd.append(
+            fast[fi] - slow_value
         )
 
-    if len(macd_values) < MACD_SIGNAL + 2:
-        return None
-
     signal = ema(
-        macd_values,
+        macd,
         MACD_SIGNAL,
     )
 
-    if len(signal) < 2:
+    if len(macd) < 2 or len(signal) < 2:
         return None
 
-    macd_current = macd_values[-1]
-
-    macd_previous = macd_values[-2]
-
-    signal_current = signal[-1]
-
-    signal_previous = signal[-2]
-
     return {
-        "macd": macd_current,
-        "previous_macd": macd_previous,
-        "signal": signal_current,
-        "previous_signal": signal_previous,
+        "macd": macd[-1],
+        "prev_macd": macd[-2],
+        "signal": signal[-1],
+        "prev_signal": signal[-2],
     }
 
 
-# ============================================================
-# SIGNAL
-# ============================================================
-
-def macd_signal(closes):
+def get_signal(closes):
 
     result = calculate_macd(closes)
 
     if not result:
         return None
 
-    macd_now = result["macd"]
-    macd_prev = result["previous_macd"]
-
-    signal_now = result["signal"]
-    signal_prev = result["previous_signal"]
-
-    bullish_cross = (
-        macd_prev <= signal_prev
-        and macd_now > signal_now
+    bullish = (
+        result["prev_macd"]
+        <= result["prev_signal"]
+        and
+        result["macd"]
+        > result["signal"]
     )
 
-    bearish_cross = (
-        macd_prev >= signal_prev
-        and macd_now < signal_now
+    bearish = (
+        result["prev_macd"]
+        >= result["prev_signal"]
+        and
+        result["macd"]
+        < result["signal"]
     )
 
-    if bullish_cross:
+    if bullish:
         return "BUY"
 
-    if bearish_cross:
+    if bearish:
         return "SELL"
 
     return None
 
 
-# ============================================================
-# CANDLE ENGINE
-# ============================================================
-
-def candle_bucket(timestamp_ms):
-
-    interval = TIMEFRAME_MINUTES * 60 * 1000
+def bucket(ts):
 
     return (
-        int(timestamp_ms) // interval
-    ) * interval
+        int(ts)
+        // TIMEFRAME_MS
+    ) * TIMEFRAME_MS
 
 
-def new_candle(timestamp_ms, price, qty=0):
-
-    return {
-        "time": candle_bucket(timestamp_ms),
-        "open": float(price),
-        "high": float(price),
-        "low": float(price),
-        "close": float(price),
-        "volume": float(qty or 0),
-    }
-
-
-def update_candle(candle, price, qty=0):
-
-    price = float(price)
-
-    candle["high"] = max(
-        candle["high"],
-        price,
-    )
-
-    candle["low"] = min(
-        candle["low"],
-        price,
-    )
-
-    candle["close"] = price
-
-    candle["volume"] += float(
-        qty or 0
-    )
-
-
-def add_trade(
+def update_price(
     state,
     symbol,
-    timestamp_ms,
+    timestamp,
     price,
-    qty=0,
 ):
 
     symbol_state = state.setdefault(
@@ -458,13 +298,11 @@ def add_trade(
         {
             "candles": [],
             "current": None,
-            "last_signal_candle": None,
+            "last_signal": None,
         },
     )
 
-    bucket = candle_bucket(
-        timestamp_ms
-    )
+    b = bucket(timestamp)
 
     current = symbol_state.get(
         "current"
@@ -472,261 +310,186 @@ def add_trade(
 
     if current is None:
 
-        symbol_state["current"] = new_candle(
-            timestamp_ms,
-            price,
-            qty,
-        )
+        symbol_state["current"] = {
+            "time": b,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+        }
 
         return None
 
-    if bucket == current["time"]:
+    if b == current["time"]:
 
-        update_candle(
-            current,
+        current["high"] = max(
+            current["high"],
             price,
-            qty,
         )
+
+        current["low"] = min(
+            current["low"],
+            price,
+        )
+
+        current["close"] = price
 
         return None
 
-    if bucket > current["time"]:
+    if b > current["time"]:
 
         closed = current.copy()
 
-        symbol_state["candles"].append(
-            closed
-        )
+        symbol_state[
+            "candles"
+        ].append(closed)
 
-        symbol_state["candles"] = (
-            symbol_state["candles"][
-                -MAX_CANDLES:
-            ]
-        )
+        symbol_state[
+            "candles"
+        ] = symbol_state[
+            "candles"
+        ][-MAX_CANDLES:]
 
-        symbol_state["current"] = new_candle(
-            timestamp_ms,
-            price,
-            qty,
-        )
+        symbol_state["current"] = {
+            "time": b,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+        }
 
         return closed
 
     return None
 
 
-# ============================================================
-# GENERIC TRADE PARSER
-# ============================================================
-
-def find_number(obj, keys):
-
-    if not isinstance(obj, dict):
-        return None
-
-    for key in keys:
-
-        value = obj.get(key)
-
-        if value is None:
-            continue
-
-        try:
-            return float(value)
-        except Exception:
-            pass
-
-    return None
-
-
-def find_timestamp(obj):
-
-    if not isinstance(obj, dict):
-        return None
-
-    keys = [
-        "T",
-        "E",
-        "timestamp",
-        "time",
-        "ts",
-        "eventTime",
-        "transactTime",
-        "tradeTime",
-    ]
-
-    for key in keys:
-
-        value = obj.get(key)
-
-        if value is None:
-            continue
-
-        try:
-            value = int(float(value))
-
-            if value < 10_000_000_000:
-                value *= 1000
-
-            return value
-
-        except Exception:
-            pass
-
-    return int(
-        time.time() * 1000
-    )
-
-
-def parse_trade_message(message):
+def parse_depth(message):
 
     if not isinstance(message, dict):
         return None
 
-    candidates = [message]
+    symbol = (
+        message.get("s")
+        or message.get("symbol")
+    )
 
-    for key in (
-        "data",
-        "result",
-        "tick",
-        "trade",
-        "payload",
-    ):
+    data = message.get("data")
 
-        value = message.get(key)
-
-        if isinstance(value, dict):
-            candidates.append(value)
-
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    candidates.append(item)
-
-    for obj in candidates:
-
-        price = find_number(
-            obj,
-            [
-                "p",
-                "price",
-                "lastPrice",
-                "last",
-                "P",
-            ],
-        )
-
-        if price is None or price <= 0:
-            continue
-
-        qty = find_number(
-            obj,
-            [
-                "q",
-                "qty",
-                "quantity",
-                "volume",
-                "size",
-                "v",
-            ],
-        ) or 0
-
-        timestamp = find_timestamp(obj)
+    if isinstance(data, dict):
 
         symbol = (
-            obj.get("s")
-            or obj.get("symbol")
-            or obj.get("S")
-            or obj.get("market")
+            data.get("s")
+            or data.get("symbol")
+            or symbol
         )
 
-        if symbol:
+        message = data
 
-            symbol = str(symbol).upper()
+    if not symbol:
+        return None
 
-        return {
-            "symbol": symbol,
-            "price": price,
-            "qty": qty,
-            "time": timestamp,
-        }
+    bids = (
+        message.get("b")
+        or message.get("bids")
+    )
 
-    return None
+    asks = (
+        message.get("a")
+        or message.get("asks")
+    )
+
+    if not bids or not asks:
+        return None
+
+    try:
+        bid = float(bids[0][0])
+        ask = float(asks[0][0])
+
+        if bid <= 0 or ask <= 0:
+            return None
+
+        price = (
+            bid + ask
+        ) / 2.0
+
+    except Exception:
+        return None
+
+    timestamp = (
+        message.get("E")
+        or message.get("T")
+        or message.get("timestamp")
+        or int(time.time() * 1000)
+    )
+
+    try:
+        timestamp = int(timestamp)
+    except Exception:
+        timestamp = int(
+            time.time() * 1000
+        )
+
+    return (
+        str(symbol).upper(),
+        timestamp,
+        price,
+    )
 
 
-# ============================================================
-# WEBSOCKET
-# ============================================================
-
-def websocket_collect(symbols, state):
+def run_websocket(
+    markets,
+    state,
+):
 
     try:
         import websocket
     except ImportError:
-        log("websocket-client not installed")
-        return 0
+        log(
+            "ERROR: websocket-client not installed"
+        )
+        return 0, 0
 
-    received = 0
-
-    ws = None
+    messages = 0
+    closed_candles = 0
 
     try:
 
         log(
-            f"Connecting WebSocket: {WS_URL}"
+            f"Connecting: {WS_URL}"
         )
 
         ws = websocket.create_connection(
             WS_URL,
             timeout=10,
-            enable_multithread=True,
         )
 
         ws.settimeout(5)
 
-        # ----------------------------------------------------
-        # Try common Tabdeal subscription formats.
-        # The first accepted response/data will determine use.
-        # ----------------------------------------------------
-
-        subscriptions = []
-
-        for symbol in symbols:
-
-            s = ws_symbol(symbol)
-
-            subscriptions.append(
-                f"trade@{s}"
-            )
-
-        payloads = [
-            {
-                "method": "SUBSCRIBE",
-                "params": subscriptions,
-                "id": 1,
-            },
-            {
-                "method": "SUBSCRIBE",
-                "params": subscriptions,
-            },
-            {
-                "op": "subscribe",
-                "args": subscriptions,
-            },
+        params = [
+            f"{symbol}@depth@2000ms"
+            for symbol in markets
         ]
 
-        # Send first format.
-        ws.send(
-            json.dumps(payloads[0])
-        )
+        payload = {
+            "method": "SUBSCRIBE",
+            "id": 1,
+            "params": params,
+        }
 
         log(
-            f"WS subscribed: {len(symbols)} markets"
+            f"Subscribing to {len(params)} depth streams"
         )
 
-        end_time = time.time() + RUN_SECONDS
+        ws.send(
+            json.dumps(payload)
+        )
 
-        while time.time() < end_time:
+        end = (
+            time.time()
+            + RUN_SECONDS
+        )
+
+        while time.time() < end:
 
             try:
 
@@ -741,123 +504,124 @@ def websocket_collect(symbols, state):
                         errors="ignore",
                     )
 
+                log(
+                    f"WS RAW: {raw[:350]}"
+                )
+
                 try:
                     message = json.loads(raw)
                 except Exception:
                     continue
 
-                trade = parse_trade_message(
+                parsed = parse_depth(
                     message
                 )
 
-                if not trade:
+                if not parsed:
                     continue
 
-                symbol = trade["symbol"]
-
-                if not symbol:
-                    continue
+                symbol, timestamp, price = parsed
 
                 normalized = symbol.replace(
                     "_",
                     "",
                 )
 
-                wanted = {
-                    s.replace("_", "").upper()
-                    for s in symbols
-                }
+                matched = None
 
-                if normalized not in wanted:
-                    continue
-
-                # Find original symbol format.
-                actual_symbol = None
-
-                for s in symbols:
+                for market in markets:
 
                     if (
-                        s.replace("_", "").upper()
+                        market.replace(
+                            "_",
+                            "",
+                        ).upper()
                         == normalized
                     ):
-                        actual_symbol = s
+                        matched = market
                         break
 
-                if not actual_symbol:
+                if not matched:
                     continue
 
-                closed = add_trade(
-                    state,
-                    actual_symbol,
-                    trade["time"],
-                    trade["price"],
-                    trade["qty"],
-                )
+                messages += 1
 
-                received += 1
+                closed = update_price(
+                    state,
+                    matched,
+                    timestamp,
+                    price,
+                )
 
                 if closed:
 
+                    closed_candles += 1
+
                     candles = state[
-                        actual_symbol
+                        matched
                     ]["candles"]
 
                     closes = [
-                        float(x["close"])
-                        for x in candles
+                        float(c["close"])
+                        for c in candles
                     ]
 
-                    if len(closes) >= (
-                        MACD_SLOW + MACD_SIGNAL + 2
-                    ):
+                    log(
+                        f"CANDLE {matched} "
+                        f"{len(closes)} "
+                        f"O={closed['open']} "
+                        f"H={closed['high']} "
+                        f"L={closed['low']} "
+                        f"C={closed['close']}"
+                    )
 
-                        signal = macd_signal(
-                            closes
+                    signal = get_signal(
+                        closes
+                    )
+
+                    if signal:
+
+                        candle_id = closed[
+                            "time"
+                        ]
+
+                        previous = state[
+                            matched
+                        ].get(
+                            "last_signal"
                         )
 
-                        if signal:
+                        if previous != candle_id:
 
-                            candle_time = closed[
-                                "time"
-                            ]
+                            state[
+                                matched
+                            ][
+                                "last_signal"
+                            ] = candle_id
 
-                            last_signal = state[
-                                actual_symbol
-                            ].get(
-                                "last_signal_candle"
+                            log(
+                                f"🚨 {signal} "
+                                f"{matched} "
+                                f"{closed['close']}"
                             )
 
-                            if last_signal != candle_time:
-
-                                state[
-                                    actual_symbol
-                                ][
-                                    "last_signal_candle"
-                                ] = candle_time
-
-                                log(
-                                    f"🚨 {signal} "
-                                    f"{actual_symbol} "
-                                    f"price={closed['close']}"
-                                )
-
-                                telegram(
-                                    f"🤖 ATI FUTURES V8\n\n"
-                                    f"Signal: {signal}\n"
-                                    f"Symbol: {actual_symbol}\n"
-                                    f"Price: {closed['close']}\n"
-                                    f"MACD: 12/26/9\n"
-                                    f"TF: 5m\n"
-                                    f"Mode: PAPER"
-                                )
+                            telegram(
+                                "🤖 ATI FUTURES V9\n\n"
+                                f"Signal: {signal}\n"
+                                f"Symbol: {matched}\n"
+                                f"Price: {closed['close']}\n"
+                                "MACD: 12/26/9\n"
+                                "TF: 5m\n"
+                                "Mode: PAPER"
+                            )
 
             except Exception as e:
 
                 text = str(e).lower()
 
                 if (
-                    "timed out" in text
-                    or "timeout" in text
+                    "timeout" in text
+                    or "timed out" in text
                 ):
                     continue
 
@@ -867,140 +631,54 @@ def websocket_collect(symbols, state):
 
                 break
 
+        ws.close()
+
     except Exception as e:
 
         log(
-            f"WebSocket connection error: {e}"
+            f"WS ERROR: {type(e).__name__}: {e}"
         )
 
-    finally:
+    return messages, closed_candles
 
-        if ws:
-
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-    return received
-
-
-# ============================================================
-# FALLBACK: DEPTH / LAST PRICE
-# ============================================================
-
-def get_last_price(symbol):
-
-    paths = [
-        "/r/fapi/v1/depth",
-        "/fapi/v1/depth",
-    ]
-
-    for path in paths:
-
-        data = public_get(
-            path,
-            {
-                "symbol": rest_symbol(symbol),
-                "limit": 5,
-            },
-        )
-
-        if not isinstance(data, dict):
-            continue
-
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-
-        prices = []
-
-        if bids:
-            try:
-                prices.append(
-                    float(bids[0][0])
-                )
-            except Exception:
-                pass
-
-        if asks:
-            try:
-                prices.append(
-                    float(asks[0][0])
-                )
-            except Exception:
-                pass
-
-        if prices:
-            return sum(prices) / len(prices)
-
-    return None
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
 
-    started = time.time()
+    start = time.time()
 
     log("=" * 60)
-    log("🤖 ATI FUTURES V8")
+    log("🤖 ATI FUTURES V9")
     log("Tabdeal Futures")
-    log("5m candles from trades")
+    log("Official Depth WebSocket")
+    log("5m synthetic candles")
     log("MACD 12/26/9")
-    log(
-        f"Mode: {'PAPER' if PAPER_MODE else 'REAL'}"
-    )
+    log("PAPER MODE")
     log("=" * 60)
 
-    if not API_KEY or not API_SECRET:
+    info = get_exchange_info()
 
-        log(
-            "WARNING: TABDEAL API credentials missing"
-        )
-
-    state = load_state()
-
-    exchange_info = get_exchange_info()
-
-    if not exchange_info:
+    if not info:
 
         log(
             "❌ ExchangeInfo failed"
         )
 
-        telegram(
-            "❌ ATI FUTURES V8\nExchangeInfo failed"
-        )
-
         return
 
-    markets = extract_markets(
-        exchange_info
-    )
-
-    if not markets:
-
-        log(
-            "❌ No USDT futures markets found"
-        )
-
-        log(
-            str(exchange_info)[:1000]
-        )
-
-        return
-
-    markets = markets[
-        :MAX_MARKETS
-    ]
+    markets = get_markets(info)
 
     log(
         f"Markets: {len(markets)}"
     )
 
-    # Initialize state.
+    if not markets:
+        log(
+            "❌ No USDT markets"
+        )
+        return
+
+    state = load_state()
+
     for symbol in markets:
 
         state.setdefault(
@@ -1008,29 +686,19 @@ def main():
             {
                 "candles": [],
                 "current": None,
-                "last_signal_candle": None,
+                "last_signal": None,
             },
         )
 
-    save_state(state)
-
-    # --------------------------------------------------------
-    # WebSocket
-    # --------------------------------------------------------
-
-    received = websocket_collect(
+    messages, closed = run_websocket(
         markets,
         state,
     )
 
     save_state(state)
 
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
-
-    total_candles = 0
     macd_ready = 0
+    total_candles = 0
 
     for symbol in markets:
 
@@ -1043,41 +711,24 @@ def main():
 
         total_candles += len(candles)
 
-        if len(candles) >= (
-            MACD_SLOW
-            + MACD_SIGNAL
-            + 2
-        ):
+        if len(candles) >= 40:
             macd_ready += 1
 
-    runtime = time.time() - started
+    runtime = (
+        time.time()
+        - start
+    )
 
     log("=" * 60)
-    log("ATI FUTURES V8 RESULT")
+    log("ATI FUTURES V9 RESULT")
     log("=" * 60)
-
-    log(
-        f"Mode: {'PAPER' if PAPER_MODE else 'REAL'}"
-    )
-
-    log(
-        "Exchange: Tabdeal Futures"
-    )
-
-    log(
-        "MACD: 12/26/9"
-    )
-
-    log(
-        "Timeframe: 5m"
-    )
 
     log(
         f"Markets: {len(markets)}"
     )
 
     log(
-        f"Trades received: {received}"
+        f"Depth messages: {messages}"
     )
 
     log(
@@ -1095,10 +746,10 @@ def main():
     log("=" * 60)
 
     telegram(
-        "🤖 ATI FUTURES V8\n\n"
-        f"Mode: {'PAPER' if PAPER_MODE else 'REAL'}\n"
+        "🤖 ATI FUTURES V9\n\n"
+        "Mode: PAPER\n"
         f"Markets: {len(markets)}\n"
-        f"Trades: {received}\n"
+        f"Depth messages: {messages}\n"
         f"Closed candles: {total_candles}\n"
         f"MACD ready: {macd_ready}\n"
         f"Runtime: {runtime:.1f}s"
